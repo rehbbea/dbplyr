@@ -14,11 +14,11 @@ partial_eval(call, data, env = caller_env(), error_call = caller_env())
 \item{env}{environment in which to search for local values}
 }
 \description{
-This function partially evaluates an expression, using information from
-the tbl to determine whether names refer to local expressions
-or remote variables. This simplifies SQL translation because expressions
-don't need to carry around their environment - all relevant information
-is incorporated into the expression.
+This function partially evaluates a quosure yielding an expression. It
+uses information from the current \code{tbl} and the local environment to yield
+a standalone expression. This simplifies SQL translation because we can just
+pass around expressions rather than expressions + environments
+(i.e. quosures).
 }
 \section{Symbol substitution}{
 
@@ -35,7 +35,8 @@ variable, then remote.
 }
 
 You can override the guesses using \code{local()} and \code{remote()} to force
-computation, or by using the \code{.data} and \code{.env} pronouns of tidy evaluation.
+computation, by using the \code{.data} and \code{.env} pronouns of tidy evaluation,
+or by using dbplyr's own \code{.sql} pronoun.
 }
 
 \examples{
@@ -60,5 +61,10 @@ partial_eval(quote(year > .env$year), lf)
 f <- function(x) x + 1
 partial_eval(quote(year > f(1980)), lf)
 partial_eval(quote(year > local(f(1980))), lf)
+
+# You can use `.sql` to make it clear that the function comes from SQL,
+# and inside a package, reduce the number of globalVariables() directives
+# needed
+partial_eval(quote(.sql$EXTRACT_YEAR(year)), lf)
 }
 \keyword{internal}

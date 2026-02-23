@@ -1,49 +1,63 @@
 test_that("filter captures local variables", {
-  mf <- memdb_frame(x = 1:5, y = 5:1)
+  mf <- local_memdb_frame(x = 1:5, y = 5:1, id = 1:5)
 
   z <- 3
-  df1 <- mf |> filter(x > z) |> collect()
-  df2 <- mf |> collect() |> filter(x > z)
-
-  compare_tbl(df1, df2)
+  expect_equal(mf |> filter(x > z) |> pull(), c(4, 5))
 })
 
 test_that("two filters equivalent to one", {
-  mf <- memdb_frame(x = 1:5, y = 5:1)
-  lf <- lazy_frame(x = 1:5, y = 5:1)
+  unique_column_name_reset()
+  mf <- local_memdb_frame("df", x = 1:5, y = 5:1, id = 1:5)
 
   df1 <- mf |> filter(x > 3) |> filter(y < 3)
-  df2 <- mf |> filter(x > 3, y < 3)
-  compare_tbl(df1, df2)
+  expect_equal(df1 |> pull(), c(4, 5))
+  expect_snapshot(df1 |> show_query())
 
-  lf1 <- lf |> filter(x > 3) |> filter(y < 3)
-  lf2 <- lf |> filter(x > 3, y < 3)
-  expect_equal(lf1 |> remote_query(), lf2 |> remote_query())
-  expect_snapshot(lf1 |> remote_query())
-
-  df1 <- mf |> filter(mean(x, na.rm = TRUE) > 3) |> filter(y < 3)
-  df2 <- mf |> filter(mean(x, na.rm = TRUE) > 3, y < 3)
-  compare_tbl(df1, df2)
-
-  unique_column_name_reset()
-  lf1 <- lf |> filter(mean(x, na.rm = TRUE) > 3) |> filter(y < 3)
-  unique_column_name_reset()
-  lf2 <- lf |> filter(mean(x, na.rm = TRUE) > 3, y < 3)
-  expect_equal(lf1 |> remote_query(), lf2 |> remote_query())
-  expect_snapshot(lf1 |> remote_query())
+  df2 <- mf |> filter(mean(x, na.rm = TRUE) > 2) |> filter(y < 3)
+  expect_equal(df2 |> pull(), c(4, 5))
+  expect_snapshot(df2 |> show_query())
 })
 
+test_that("correctly inlines across all verbs", {
+  lf <- lazy_frame(x = 1, y = 2)
+
+  # single table verbs
+  expect_selects(lf |> arrange(x) |> filter(x == 1), 1)
+  expect_selects(lf |> distinct() |> filter(x == 1), 1)
+  expect_selects(lf |> filter(x == 1) |> filter(y == 1), 1)
+  expect_selects(lf |> head(1) |> filter(x == 1), 1)
+  expect_selects(lf |> mutate(z = x + 1) |> filter(x == 1), 1)
+  expect_selects(lf |> select(y = x) |> filter(y == 1), 1)
+  expect_selects(lf |> summarise(y = mean(x)) |> filter(y == 1), 1)
+
+  # two table verbs
+  lf2 <- lazy_frame(x = 1)
+  expect_selects(lf |> left_join(lf2, by = "x") |> filter(x == 1), 1)
+  expect_selects(lf |> right_join(lf2, by = "x") |> filter(x == 1), 2)
+  expect_selects(lf |> semi_join(lf2, by = "x") |> filter(x == 1), 3)
+  expect_selects(lf |> union(lf2) |> filter(x == 1), 3)
+
+  # special cases
+  expect_selects(lf |> filter(mean(x) == 1), 2)
+  expect_selects(lf |> mutate(x2 = mean(x)) |> filter(x == 1), 2)
+  expect_selects(lf |> mutate(z = sql("x")) |> filter(z == 1), 2)
+  expect_selects(lf |> mutate(z = x + 1) |> filter(z == 1), 2)
+
+  # flag add_filter() for update if add_mutate ever gains inlining
+  expect_selects(lf |> mutate(z = x + 1) |> filter(n() == 1), 3)
+})
 
 test_that("each argument gets implicit parens", {
-  mf <- memdb_frame(
+  mf <- local_memdb_frame(
     v1 = c("a", "b", "a", "b"),
     v2 = c("b", "a", "a", "b"),
-    v3 = c("a", "b", "c", "d")
+    v3 = c("a", "b", "c", "d"),
+    id = 1:4
   )
 
-  mf1 <- mf |> filter((v1 == "a" | v2 == "a") & v3 == "a")
-  mf2 <- mf |> filter(v1 == "a" | v2 == "a", v3 == "a")
-  compare_tbl(mf1, mf2)
+  # want (v1 == "a" | v2 == "a") & v3 == "a"
+  # NOT (v1 == "a" | v2 == "a" & v3 == "a")
+  expect_equal(mf |> filter(v1 == "a" | v2 == "a", v3 == "a") |> pull(), 1)
 })
 
 test_that("only add step if necessary", {
@@ -72,7 +86,7 @@ test_that("filter() inlined after select()", {
 
   expect_equal(
     remote_query(out),
-    sql("SELECT `y`\nFROM `df`\nWHERE (`y` > 1.0)")
+    sql("SELECT \"y\"\nFROM \"df\"\nWHERE (\"y\" > 1.0)")
   )
 
   out <- lf |>
@@ -80,7 +94,7 @@ test_that("filter() inlined after select()", {
     filter(z == 1)
   lq <- out$lazy_query
   expect_equal(lq$select$expr, list(sym("x")))
-  expect_equal(lq$where, list(quo(x == 1)), ignore_formula_env = TRUE)
+  expect_equal(lq$where, list(expr(x == 1)))
 })
 
 test_that("filter() inlined after mutate()", {
@@ -90,12 +104,8 @@ test_that("filter() inlined after mutate()", {
     mutate(x = x + 1) |>
     filter(y == 1)
   lq <- out$lazy_query
-  expect_equal(
-    lq$select$expr,
-    list(quo(x + 1), sym("y")),
-    ignore_formula_env = TRUE
-  )
-  expect_equal(lq$where, list(quo(y == 1)), ignore_formula_env = TRUE)
+  expect_equal(lq$select$expr, list(expr(x + 1), expr(y)))
+  expect_equal(lq$where, list(expr(y == 1)))
 
   # can rename variable used in `filter()`
   out <- lf |>
@@ -104,20 +114,16 @@ test_that("filter() inlined after mutate()", {
   lq <- out$lazy_query
   expect_equal(lq$select$expr, list(sym("x"), sym("y")))
   expect_equal(lq$select$name, c("z", "y"))
-  expect_equal(lq$where, list(quo(x == 1)), ignore_formula_env = TRUE)
+  expect_equal(lq$where, list(expr(x == 1)))
 
   # does not inline if uses mutated variable
   out2 <- lf |>
     mutate(x = x + 1) |>
     filter(x == 1)
   lq2 <- out2$lazy_query
-  expect_equal(
-    lq2$x$select$expr,
-    list(quo(x + 1), sym("y")),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(lq2$x$select$expr, list(expr(x + 1), sym("y")))
   expect_equal(lq2$select$expr, syms(c("x", "y")))
-  expect_equal(lq2$where, list(quo(x == 1)), ignore_formula_env = TRUE)
+  expect_equal(lq2$where, list(expr(x == 1)))
 
   # does not inline if unclear whether uses mutated variable
   out3 <- lf |>
@@ -126,7 +132,8 @@ test_that("filter() inlined after mutate()", {
   lq3 <- out3$lazy_query
   expect_equal(lq3$select$expr, syms(c("x", "y")))
   expect_s3_class(lq3$x, "lazy_select_query")
-  expect_equal(lq3$where, list(quo(y == sql("1"))), ignore_formula_env = TRUE)
+  # sql("1") is evaluated during partial_eval
+  expect_equal(lq3$where[[1]], expr(y == !!sql("1")))
 })
 
 test_that("filter isn't inlined after mutate with window function #1135", {
@@ -137,11 +144,8 @@ test_that("filter isn't inlined after mutate with window function #1135", {
 
   lq <- out$lazy_query
   expect_equal(lq$select$expr, syms(c("x", "y", "z")))
-  expect_equal(lq$where, list(quo(y <= 1)), ignore_formula_env = TRUE)
-  expect_equal(
-    quo_get_expr(lq$x$select$expr[[3]]),
-    expr(sum(y, na.rm = TRUE))
-  )
+  expect_equal(lq$where, list(expr(y <= 1)))
+  expect_equal(lq$x$select$expr[[3]], expr(sum(y, na.rm = TRUE)))
 
   out2 <- lf |>
     dplyr::mutate(z = sql("SUM(y) OVER ()")) |>
@@ -149,17 +153,15 @@ test_that("filter isn't inlined after mutate with window function #1135", {
 
   lq2 <- out2$lazy_query
   expect_equal(lq2$select$expr, syms(c("x", "y", "z")))
-  expect_equal(lq2$where, list(quo(y <= 1)), ignore_formula_env = TRUE)
-  expect_equal(
-    quo_get_expr(lq2$x$select$expr[[3]]),
-    expr(sql("SUM(y) OVER ()"))
-  )
+  expect_equal(lq2$where, list(expr(y <= 1)))
+  # sql() is evaluated during partial_eval
+  expect_equal(lq2$x$select$expr[[3]], sql("SUM(y) OVER ()"))
 })
 
 # .by -------------------------------------------------------------------------
 
 test_that("can group transiently using `.by`", {
-  df <- memdb_frame(g = c(1, 1, 2, 1, 2), x = c(5, 10, 1, 2, 3))
+  df <- local_memdb_frame(g = c(1, 1, 2, 1, 2), x = c(5, 10, 1, 2, 3))
 
   out <- filter(df, x > mean(x), .by = g) |>
     arrange(g, x) |>
@@ -182,7 +184,7 @@ test_that("catches `.by` with grouped-df", {
 # SQL generation --------------------------------------------------------
 
 test_that("filter calls windowed versions of sql functions", {
-  df1 <- memdb_frame(x = 1:10, g = rep(c(1, 2), each = 5))
+  df1 <- local_memdb_frame(x = 1:10, g = rep(c(1, 2), each = 5))
 
   out <- df1 |> group_by(g) |> filter(dplyr::row_number(x) < 3) |> collect()
   expect_equal(out$x, c(1L, 2L, 6L, 7L))
@@ -197,7 +199,7 @@ test_that("filter() can use window function and external vector - #1048", {
 })
 
 test_that("recycled aggregates generate window function", {
-  df1 <- memdb_frame(x = 1:10, g = rep(c(1, 2), each = 5))
+  df1 <- local_memdb_frame(x = 1:10, g = rep(c(1, 2), each = 5))
 
   out <- df1 |>
     group_by(g) |>
@@ -207,7 +209,7 @@ test_that("recycled aggregates generate window function", {
 })
 
 test_that("cumulative aggregates generate window function", {
-  df1 <- memdb_frame(x = c(1:3, 2:4), g = rep(c(1, 2), each = 3))
+  df1 <- local_memdb_frame(x = c(1:3, 2:4), g = rep(c(1, 2), each = 3))
   out <- df1 |>
     group_by(g) |>
     window_order(x) |>
@@ -220,22 +222,14 @@ test_that("filter() after summarise() uses `HAVING`", {
   lf <- lazy_frame(g = 1, h = 1, x = 1) |>
     group_by(g, h) |>
     summarise(x_mean = mean(x, na.rm = TRUE), .groups = "drop_last")
-  mf <- memdb_frame(g = c(1, 1, 1, 2, 2), h = 1, x = 1:5) |>
+  mf <- local_memdb_frame(g = c(1, 1, 1, 2, 2), h = 1, x = 1:5) |>
     group_by(g, h) |>
     summarise(x_mean = mean(x, na.rm = TRUE), .groups = "drop_last")
 
   # use `HAVING`
   expect_snapshot((out <- lf |> filter(g == 1)))
-  expect_equal(
-    out$lazy_query$having,
-    list(quo(g == 1)),
-    ignore_formula_env = TRUE
-  )
-  expect_equal(
-    out$lazy_query$group_by,
-    list(sym("g"), sym("h")),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(out$lazy_query$having, list(expr(g == 1)))
+  expect_equal(out$lazy_query$group_by, list(sym("g"), sym("h")))
   expect_equal(op_grps(out), "g")
 
   expect_equal(
@@ -247,11 +241,7 @@ test_that("filter() after summarise() uses `HAVING`", {
 
   # Can use freshly aggregated column
   expect_snapshot((out <- lf |> filter(x_mean > 1)))
-  expect_equal(
-    out$lazy_query$having,
-    list(quo(mean(x, na.rm = TRUE) > 1)),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(out$lazy_query$having, list(expr(mean(x, na.rm = TRUE) > 1)))
 
   expect_equal(
     mf |>
@@ -266,22 +256,14 @@ test_that("filter() after summarise() uses `HAVING`", {
       filter(g == 1) |>
       filter(g == 2))
   )
-  expect_equal(
-    out$lazy_query$having,
-    list(quo(g == 1), quo(g == 2)),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(out$lazy_query$having, list(expr(g == 1), expr(g == 2)))
 
   expect_snapshot(
     (out <- lf |>
       filter(g == 1) |>
       filter(h == 2))
   )
-  expect_equal(
-    out$lazy_query$having,
-    list(quo(g == 1), quo(h == 2)),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(out$lazy_query$having, list(expr(g == 1), expr(h == 2)))
 
   # `window_order()` and `window_frame()` do not matter
   out <- lazy_frame(g = 1, h = 1, x = 1) |>
@@ -292,13 +274,9 @@ test_that("filter() after summarise() uses `HAVING`", {
     filter(x_mean > 1)
 
   lq <- out$lazy_query
-  expect_equal(
-    lq$having,
-    list(quo(mean(x, na.rm = TRUE) > 1)),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(lq$having, list(expr(mean(x, na.rm = TRUE) > 1)))
   # TODO should the `order_vars` and the `frame` really survive `summarise()`?
-  expect_equal(lq$order_vars, list(quo(h)))
+  expect_equal(lq$order_vars, list(expr(h)))
   expect_equal(lq$frame, list(range = c(-3, Inf)))
 })
 
@@ -314,11 +292,7 @@ test_that("`HAVING` supports expressions #1128", {
   out <- lf |>
     summarise(x_sum = sum(x, na.rm = TRUE)) |>
     filter(!is.na(x_sum))
-  expect_equal(
-    out$lazy_query$having,
-    list(quo(!is.na(sum(x, na.rm = TRUE)))),
-    ignore_formula_env = TRUE
-  )
+  expect_equal(out$lazy_query$having, list(expr(!is.na(sum(x, na.rm = TRUE)))))
 
   # correctly handles environments
   y <- 1L
@@ -331,8 +305,7 @@ test_that("`HAVING` supports expressions #1128", {
 
   expect_equal(
     out$lazy_query$having,
-    list(quo(!is.na(sum(x, na.rm = TRUE) - 2L + 1L))),
-    ignore_formula_env = TRUE
+    list(expr(!is.na(sum(x, na.rm = TRUE) - 2L + 1L)))
   )
 })
 
@@ -363,9 +336,8 @@ test_that("filter generates simple expressions", {
     filter(x > 1L) |>
     sql_build()
 
-  expect_equal(out$where, sql('`x` > 1'))
+  expect_equal(out$where, sql('"x" > 1'))
 })
-
 
 # lazy_select_query -------------------------------------------------------
 
@@ -377,9 +349,8 @@ test_that("generates correct lazy_select_query", {
     lazy_select_query(
       x = lf$lazy_query,
       select = syms(set_names(colnames(lf))),
-      where = list(quo(x > 1))
-    ),
-    ignore_formula_env = TRUE
+      where = list(expr(x > 1))
+    )
   )
 
   out <- lf |>
@@ -391,8 +362,7 @@ test_that("generates correct lazy_select_query", {
       x = out$lazy_query$x,
       select = syms(set_names(colnames(lf))),
       where = list(expr(col01 > 1))
-    ),
-    ignore_formula_env = TRUE
+    )
   )
 
   expect_equal(
@@ -403,9 +373,8 @@ test_that("generates correct lazy_select_query", {
       select = list(
         x = sym("x"),
         y = sym("y"),
-        col01 = quo(mean(x, na.rm = TRUE))
+        col01 = expr(mean(x, na.rm = TRUE))
       )
-    ),
-    ignore_formula_env = TRUE
+    )
   )
 })

@@ -13,15 +13,24 @@
 #'
 #' @param x,y A pair of lazy data frames backed by database queries.
 #' @inheritParams dplyr::join
-#' @param copy If `x` and `y` are not from the same data source,
-#'   and `copy` is `TRUE`, then `y` will be copied into a
-#'   temporary table in same database as `x`. `*_join()` will automatically
-#'   run `ANALYZE` on the created table in the hope that this will make
-#'   you queries as efficient as possible by giving more data to the query
-#'   planner.
+#' @param copy If `x` and `y` are not from the same data source, `copy`
+#'   controls how `y` is copied into the same source as `x`. There are three
+#'   options:
 #'
-#'   This allows you to join tables across srcs, but it's potentially expensive
-#'   operation so you must opt into it.
+#'  * `"none"`, the default, will error if `y` needs to be copied. This ensures
+#'    that you don't accidentally copy large datasets from R to the database.
+#'
+#'   * `"temp-table"`: copies `y` into a temporary table in the same
+#'     database as `x`. `*_join()` will automatically run `ANALYZE` on the
+#'     created table in the hope that this will make your queries as efficient
+#'     as possible by giving more data to the query planner.
+#'
+#'   * `"inline"`: `y` will be inlined into the query using [copy_inline()].
+#'     This is should faster for small datasets and doesn't require write
+#'     access.
+#'
+#'   `TRUE` (`"temp-table"`) and `FALSE` (`"none"`) are also accepted for
+#'   backward compatibility.
 #' @param auto_index if `copy` is `TRUE`, automatically create
 #'   indices for the variables in `by`. This may speed up the join if
 #'   there are matching indexes in `x`.
@@ -43,8 +52,8 @@
 #' @examples
 #' library(dplyr, warn.conflicts = FALSE)
 #'
-#' band_db <- tbl_memdb(dplyr::band_members)
-#' instrument_db <- tbl_memdb(dplyr::band_instruments)
+#' band_db <- copy_to(memdb(), dplyr::band_members)
+#' instrument_db <- copy_to(memdb(), dplyr::band_instruments)
 #' band_db |> left_join(instrument_db) |> show_query()
 #'
 #' # Can join with local data frames by setting copy = TRUE
@@ -74,7 +83,7 @@ inner_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   suffix = NULL,
   ...,
   keep = NULL,
@@ -116,7 +125,7 @@ left_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   suffix = NULL,
   ...,
   keep = NULL,
@@ -158,7 +167,7 @@ right_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   suffix = NULL,
   ...,
   keep = NULL,
@@ -200,7 +209,7 @@ full_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   suffix = NULL,
   ...,
   keep = NULL,
@@ -240,7 +249,7 @@ cross_join.tbl_lazy <- function(
   x,
   y,
   ...,
-  copy = FALSE,
+  copy = "none",
   suffix = c(".x", ".y"),
   x_as = NULL,
   y_as = NULL
@@ -271,7 +280,7 @@ semi_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   ...,
   na_matches = c("never", "na"),
   sql_on = NULL,
@@ -303,7 +312,7 @@ anti_join.tbl_lazy <- function(
   x,
   y,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   ...,
   na_matches = c("never", "na"),
   sql_on = NULL,
@@ -333,7 +342,7 @@ add_join <- function(
   y,
   type,
   by = NULL,
-  copy = FALSE,
+  copy = "none",
   suffix = NULL,
   keep = NULL,
   na_matches = "never",
@@ -370,14 +379,15 @@ add_join <- function(
     call = call
   )
 
-  y <- auto_copy(
+  y <- dbplyr_auto_copy(
     x,
     y,
     copy = copy,
-    indexes = if (auto_index) list(by$y)
+    indexes = if (auto_index) list(by$y),
+    call = call
   )
 
-  suffix <- suffix %||% sql_join_suffix(x$src$con, suffix)
+  suffix <- suffix %||% sql_join_suffix(x$con, suffix)
   vars <- join_cols(
     x_names = x_names,
     y_names = y_names,
@@ -392,7 +402,7 @@ add_join <- function(
   # the table alias can only be determined after `select()` was inlined.
   # This works even though `by` is used in `join_inline_select()` and updated
   # because this does not touch `by$x_as` and `by$y_as`.
-  join_alias <- make_join_aliases(x$src$con, x_as, y_as, sql_on, call)
+  join_alias <- make_join_aliases(x$con, x_as, y_as, sql_on, call)
 
   inline_result <- join_inline_select(x$lazy_query, by$x, by$on)
   x_lq <- inline_result$lq
@@ -435,12 +445,12 @@ add_join <- function(
     return(out)
   }
 
-  new_query <- join_needs_new_query(x$lazy_query, join_alias, type)
+  can_inline <- can_inline_join(x$lazy_query, join_alias, type)
   vars <- multi_join_vars(
     x_lq = x_lq,
     x_vars = x_vars,
     y_vars = y_vars,
-    new_query = new_query,
+    can_inline = can_inline,
     vars_info = vars,
     error_call = call
   )
@@ -448,7 +458,7 @@ add_join <- function(
   joins_data <- new_joins_data(
     x_lq,
     y_lq,
-    new_query = new_query,
+    can_inline = can_inline,
     type = type,
     by = by,
     na_matches = na_matches
@@ -456,7 +466,7 @@ add_join <- function(
 
   table_names_y <- make_table_names(join_alias$y, y_lq)
 
-  if (new_query) {
+  if (!can_inline) {
     table_names_x <- make_table_names(join_alias$x, x_lq)
     out <- lazy_multi_join_query(
       x = x_lq,
@@ -480,32 +490,83 @@ add_join <- function(
   x_lq
 }
 
-join_inline_select <- function(lq, by, on) {
-  if (is_empty(on) && is_lazy_select_query_simple(lq, select = "projection")) {
+join_inline_select <- function(lq, by, on, semi = FALSE) {
+  can_inline <- can_inline_join_select(
+    lq,
+    ignore_where = semi,
+    ignore_group_by = semi
+  )
+
+  if (is_empty(on) && can_inline) {
     vars <- purrr::map_chr(lq$select$expr, as_string)
 
-    idx <- vctrs::vec_match(lq$select$name, by)
-    by <- vctrs::vec_assign(by, idx, vars)
+    # Rename join by columns if needed
+    idx <- match(by, lq$select$name)
+    matched <- !is.na(idx)
+    by[matched] <- vars[idx[matched]]
 
     lq_org <- lq
     lq <- lq$x
     lq$group_vars <- op_grps(lq_org)
     lq$order_vars <- op_sort(lq_org)
     lq$frame <- op_frame(lq_org)
+
+    where <- if (semi) lq_org$where
   } else {
     vars <- op_vars(lq)
+    where <- NULL
   }
 
   list(
     lq = lq,
     vars = vars,
-    by = by
+    by = by,
+    where = where
   )
 }
 
-join_needs_new_query <- function(x_lq, join_alias, type) {
+# projection = only select (including rename) from parent query
+can_inline_join_select <- function(
+  x,
+  ignore_where = FALSE,
+  ignore_group_by = FALSE
+) {
+  if (!is_lazy_select_query(x)) {
+    return(FALSE)
+  }
+
+  if (!is_projection(x$select$expr)) {
+    return(FALSE)
+  }
+
+  if (!ignore_where && !is_empty(x$where)) {
+    return(FALSE)
+  }
+  if (!ignore_group_by && !is_empty(x$group_by)) {
+    return(FALSE)
+  }
+  if (!is_empty(x$order_by)) {
+    return(FALSE)
+  }
+  if (is_true(x$distinct)) {
+    return(FALSE)
+  }
+  if (!is_empty(x$limit)) {
+    return(FALSE)
+  }
+  if (!is_empty(x$having)) {
+    return(FALSE)
+  }
+
+  TRUE
+}
+
+# Joins add tables to the FROM clause
+# * Can only inline into an existing multi-join query
+# * Table aliases must not conflict with existing aliases
+can_inline_join <- function(x_lq, join_alias, type) {
   if (!inherits(x_lq, "lazy_multi_join_query")) {
-    return(TRUE)
+    return(FALSE)
   }
 
   x_as <- join_alias$x
@@ -515,42 +576,42 @@ join_needs_new_query <- function(x_lq, join_alias, type) {
   from <- x_lq$table_names$from
   if (!is_null(x_as)) {
     if (from[[1]] == "as" && !identical(x_as, names[[1]])) {
-      return(TRUE)
+      return(FALSE)
     }
 
     if (x_as %in% names[-1][from[-1] == "as"]) {
-      return(TRUE)
+      return(FALSE)
     }
   }
 
   if (!is_null(y_as)) {
     if (y_as %in% names[from == "as"]) {
-      return(TRUE)
+      return(FALSE)
     }
   }
 
-  FALSE
+  TRUE
 }
 
 multi_join_vars <- function(
   x_lq,
   x_vars,
   y_vars,
-  new_query,
+  can_inline,
   vars_info,
   error_call
 ) {
-  if (new_query) {
+  if (can_inline) {
+    x_join_vars <- vctrs::vec_slice(x_lq$vars, vars_info$x$out)
+    x_join_vars$name <- names(vars_info$x$out)
+    table_id <- vctrs::vec_size(x_lq$table_names) + 1L
+  } else {
     x_join_vars <- tibble(
       name = names(vars_info$x$out),
       table = 1L,
       var = vctrs::vec_slice(x_vars, vars_info$x$out)
     )
     table_id <- 2L
-  } else {
-    x_join_vars <- vctrs::vec_slice(x_lq$vars, vars_info$x$out)
-    x_join_vars$name <- names(vars_info$x$out)
-    table_id <- vctrs::vec_size(x_lq$table_names) + 1L
   }
 
   y_join_vars <- tibble(
@@ -633,15 +694,15 @@ join_prepare_by <- function(
   by
 }
 
-new_joins_data <- function(x_lq, y_lq, new_query, type, by, na_matches) {
-  if (new_query) {
-    by_x_table_id <- rep_along(by$x, 1L)
-  } else {
+new_joins_data <- function(x_lq, y_lq, can_inline, type, by, na_matches) {
+  if (can_inline) {
     idx <- vctrs::vec_match(by$x, x_lq$vars$name)
 
     # need to fix `by$x` in case it was renamed in an inlined select
     by$x <- x_lq$vars$var[idx]
     by_x_table_id <- x_lq$vars$table[idx]
+  } else {
+    by_x_table_id <- rep_along(by$x, 1L)
   }
 
   tibble(
@@ -664,7 +725,7 @@ add_semi_join <- function(
   anti = FALSE,
   by = NULL,
   sql_on = NULL,
-  copy = FALSE,
+  copy = "none",
   auto_index = FALSE,
   na_matches = "never",
   x_as = NULL,
@@ -685,11 +746,12 @@ add_semi_join <- function(
   check_join_by_supported(by, call = call)
   na_matches <- arg_match(na_matches, c("na", "never"), error_call = call)
 
-  y <- auto_copy(
+  y <- dbplyr_auto_copy(
     x,
     y,
-    copy,
-    indexes = if (auto_index) list(by$y)
+    copy = copy,
+    indexes = if (auto_index) list(by$y),
+    call = call
   )
 
   inline_result <- join_inline_select(x$lazy_query, by$x, sql_on)
@@ -697,7 +759,7 @@ add_semi_join <- function(
   x_vars <- inline_result$vars
   by$x <- inline_result$by
 
-  inline_result <- semi_join_inline_select(y$lazy_query, by$y, sql_on)
+  inline_result <- join_inline_select(y$lazy_query, by$y, sql_on, semi = TRUE)
   y_lq <- inline_result$lq
   by$y <- inline_result$by
   where <- inline_result$where
@@ -709,7 +771,7 @@ add_semi_join <- function(
   by$na_matches <- na_matches
 
   # the table alias can only be determined after `select()` was inlined
-  join_alias <- make_join_aliases(x$src$con, x_as, y_as, sql_on, call)
+  join_alias <- make_join_aliases(x$con, x_as, y_as, sql_on, call)
 
   aliases <- vctrs::vec_rbind(
     make_table_names(join_alias$x, x_lq),
@@ -727,42 +789,6 @@ add_semi_join <- function(
     by = by,
     where = where,
     call = call
-  )
-}
-
-can_inline_semi_join <- function(x) {
-  is_lazy_select_query_simple(
-    x,
-    ignore_where = TRUE,
-    ignore_group_by = TRUE,
-    select = "projection"
-  )
-}
-
-semi_join_inline_select <- function(lq, by, on) {
-  if (is_empty(on) && can_inline_semi_join(lq)) {
-    vars <- purrr::map_chr(lq$select$expr, as_string)
-
-    idx <- vctrs::vec_match(lq$select$name, by)
-    by <- vctrs::vec_assign(by, idx, vars)
-
-    lq_org <- lq
-    lq <- lq$x
-    lq$group_vars <- op_grps(lq_org)
-    lq$order_vars <- op_sort(lq_org)
-    lq$frame <- op_frame(lq_org)
-
-    where <- lq_org$where
-  } else {
-    vars <- op_vars(lq)
-    where <- NULL
-  }
-
-  list(
-    lq = lq,
-    vars = vars,
-    by = by,
-    where = where
   )
 }
 

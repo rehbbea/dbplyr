@@ -28,6 +28,8 @@ reference:
   - copy_inline
   - pull.tbl_sql
   - show_query
+  - last_sql
+  - .sql
 
 - subtitle: Verbs that affect rows
   contents:
@@ -51,6 +53,7 @@ reference:
 
 - subtitle: Verbs that work with multiple tables
   contents:
+  - bind_queries
   - inner_join.tbl_lazy
   - intersect.tbl_lazy
 
@@ -93,7 +96,7 @@ reference:
   - db-io
   - db-misc
   - db-sql
-  - db-quote
+  - escape
   - sql_glue2
   - sql_variant
   - sql_query_insert

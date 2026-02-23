@@ -11,7 +11,10 @@
 #' @include import-standalone-obj-type.R
 #' @include import-standalone-types-check.R
 #' @include utils-check.R
+#' @include db.R
 #' @include db-sql.R
+#' @include verb-copy-to.R
+#' @include verb-copy-inline.R
 NULL
 
 #' @export
@@ -62,7 +65,7 @@ base_scalar <- sql_translator(
   },
 
   `$` = function(x, name) {
-    if (is.sql(x)) {
+    if (is.ident(x)) {
       sql_glue("{x}.{name}")
     } else {
       eval(bquote(`$`(x, .(substitute(name)))))
@@ -94,7 +97,7 @@ base_scalar <- sql_translator(
   `>=` = sql_infix(">="),
 
   `%in%` = function(x, table) {
-    if (is.sql(table)) {
+    if (is.ident(table)) {
       return(sql_glue("{x} IN {table}"))
     }
 
@@ -212,6 +215,11 @@ base_scalar <- sql_translator(
   # Postgres - https://www.postgresql.org/docs/8.4/static/datatype-numeric.html
   # Impala - https://impala.apache.org/docs/build/html/topics/impala_bigint.html
   as.integer64 = sql_cast("BIGINT"),
+  as.blob = sql_cast("BLOB"),
+  as = function(x, type) {
+    check_string(type)
+    sql_glue("CAST({x} AS {.sql type})")
+  },
 
   c = function(...) {
     c(...)
@@ -365,11 +373,6 @@ base_scalar <- sql_translator(
   str_wrap = sql_not_supported("str_wrap")
 )
 
-base_symbols <- sql_translator(
-  pi = sql("PI()"),
-  `*` = sql("*"),
-  `NULL` = sql("NULL")
-)
 sql_exp <- function(a, x) {
   a <- as.integer(a)
   if (identical(a, 1L)) {

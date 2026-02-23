@@ -210,7 +210,7 @@ across_fun <- function(fun, env, dots, fn) {
       )
     }
 
-    partial_eval_prepare_fun(f_rhs(fun), c(".", ".x"))
+    partial_eval_prepare_fun(f_rhs(fun), c(".", ".x", "..1"), env)
   } else if (is_call(fun, "function")) {
     fun <- eval(fun, env)
     partial_eval_fun(fun, env, fn)
@@ -235,17 +235,44 @@ partial_eval_fun <- function(fun, env, fn) {
   }
   args <- fn_fmls_names(fun)
 
-  partial_eval_prepare_fun(body[[2]], args[[1]])
+  partial_eval_prepare_fun(body[[2]], args[[1]], fn_env(fun))
 }
 
-partial_eval_prepare_fun <- function(call, sym) {
-  call <- replace_sym(call, sym, replace = quote(!!.x))
+partial_eval_prepare_fun <- function(call, sym, env) {
+  # First resolve any .data/.env pronouns before symbol replacement
+  call <- resolve_mask_pronouns(call, env)
+  call <- replace_sym1(call, sym, replace = quote(!!.x))
   call <- replace_call(call, replace = quote(!!.cur_col))
   function(x, .cur_col) {
     inject(
       expr(!!call),
       child_env(empty_env(), .x = x, expr = rlang::expr, .cur_col = .cur_col)
     )
+  }
+}
+
+resolve_mask_pronouns <- function(call, env) {
+  if (is_mask_pronoun(call)) {
+    var <- call[[3]]
+
+    if (is_symbol(call[[2]], ".data")) {
+      if (is_call(call, "[[")) {
+        sym(eval(var, env))
+      } else {
+        var
+      }
+    } else {
+      if (is_call(call, "[[")) {
+        env_get(env, var)
+      } else {
+        env_get(env, as.character(var))
+      }
+    }
+  } else if (is_call(call)) {
+    call[] <- lapply(call, resolve_mask_pronouns, env = env)
+    call
+  } else {
+    call
   }
 }
 
@@ -318,7 +345,9 @@ across_setup <- function(data, call, env, allow_rename, fn, error_call) {
     repair = "check_unique"
   )
 
-  across_apply_fns(vars, fns, names_out, env)
+  out <- across_apply_fns(vars, fns, names_out, env)
+  # Partially evaluate each expression (e.g., to evaluate sql() calls)
+  lapply(out, partial_eval, data = data, env = env, error_call = error_call)
 }
 
 expr_as_label <- function(expr, name) {

@@ -74,6 +74,11 @@ test_that("across() translates formulas", {
   )
 
   expect_equal(
+    capture_across(lf, across(a:b, ~ log(..1))),
+    exprs(a = log(a), b = log(b))
+  )
+
+  expect_equal(
     capture_across(lf, across(a:b, ~2)),
     exprs(a = 2, b = 2)
   )
@@ -230,7 +235,7 @@ test_that("across() can handle empty selection", {
 
   expect_equal(
     lf |> mutate(across(character(), c)) |> remote_query(),
-    sql("SELECT *\nFROM `df`")
+    sql("SELECT *\nFROM \"df\"")
   )
 })
 
@@ -263,39 +268,59 @@ test_that("across() uses environment from the current quosure (dplyr#5460)", {
 
   expect_equal(
     partial_eval_dots(lf, across(all_of(y), mean)),
-    list(x = quo(mean(x)))
+    list(x = expr(mean(x)))
   )
 
   expect_equal(
     partial_eval_dots(lf, if_all(all_of(y), ~ .x < 2)),
-    list(quo((x < 2))),
+    list(expr((x < 2))),
     ignore_attr = "names"
   )
 })
 
 test_that("lambdas in across() can use columns", {
-  lf <- lazy_frame(x = 2, y = 4, z = 8)
+  db <- local_memdb_frame("across", x = 2, y = 4, z = 8)
 
   expect_equal(
-    partial_eval_dots(lf, across(everything(), ~ .x / y)),
+    partial_eval_dots(db, across(everything(), ~ .x / y)),
     list(
-      x = quo(x / y),
-      y = quo(y / y),
-      z = quo(z / y)
+      x = expr(x / y),
+      y = expr(y / y),
+      z = expr(z / y)
     )
   )
 
-  skip("not yet correctly supported")
-  # dplyr uses the old value of `y` for division
-  df <- tibble(x = 2, y = 4, z = 8)
-  df |> mutate(across(everything(), ~ .x / .data$y))
-  # so this is the equivalent
-  df |> mutate(data.frame(x = x / y, y = y / y, z = z / y))
-  # dbplyr uses the new value of `y`
-  lf |> mutate(across(everything(), ~ .x / .data$y))
+  db_across <- db |> mutate(across(everything(), ~ .x / y))
+  expect_snapshot(db_across |> show_query())
 
-  # so this is the dbplyr equivalent
-  df |> mutate(x = x / y, y = y / y, z = z / y)
+  # z should be 2 because the value of .data$y is only transformed
+  # _after_ across() is complete, the same as
+  # db |> collect() |> mutate(across(everything(), ~ .x / .data$y))
+  expect_equal(collect(db_across), tibble(x = 0.5, y = 1, z = 2))
+})
+
+test_that("can use .data and .env pronouns(#1520)", {
+  lf <- lazy_frame(x = 1, y = 2)
+
+  my_col <- "y"
+  expect_equal(
+    capture_across(lf, across(x:y, !!quo(~ .x / .data$y))),
+    exprs(x = x / y, y = y / y)
+  )
+  expect_equal(
+    capture_across(lf, across(x:y, !!quo(~ .x / .data[[my_col]]))),
+    exprs(x = x / y, y = y / y)
+  )
+
+  y <- 10
+  expect_equal(
+    capture_across(lf, across(x:y, !!quo(~ .x / .env$y))),
+    exprs(x = x / 10, y = y / 10)
+  )
+  expect_equal(
+    capture_across(lf, across(x:y, !!quo(~ .x / .env[["y"]]))),
+    exprs(x = x / 10, y = y / 10)
+  )
 })
 
 test_that("can pass quosure through `across()`", {
@@ -469,7 +494,9 @@ test_that("if_all/any is wrapped in parentheses #1153", {
 
   expect_equal(
     lf |> filter(if_any(c(a, b)) & c == 3) |> remote_query(),
-    sql("SELECT `df`.*\nFROM `df`\nWHERE ((`a` OR `b`) AND `c` = 3.0)")
+    sql(
+      "SELECT \"df\".*\nFROM \"df\"\nWHERE ((\"a\" OR \"b\") AND \"c\" = 3.0)"
+    )
   )
 })
 
@@ -513,11 +540,11 @@ test_that("if_any() and if_all() expansions deal with single inputs", {
   # Single inputs
   expect_equal(
     filter(d, if_any(x, ~FALSE)) |> remote_query(),
-    sql("SELECT `df`.*\nFROM `df`\nWHERE ((FALSE))")
+    sql("SELECT \"df\".*\nFROM \"df\"\nWHERE ((FALSE))")
   )
   expect_equal(
     filter(d, if_all(x, ~FALSE)) |> remote_query(),
-    sql("SELECT `df`.*\nFROM `df`\nWHERE ((FALSE))")
+    sql("SELECT \"df\".*\nFROM \"df\"\nWHERE ((FALSE))")
   )
 })
 
@@ -634,12 +661,12 @@ test_that("can `arrange()` with `pick()` selection", {
 
   expect_identical(
     arrange(df, pick(x, y)) |> remote_query(),
-    sql("SELECT `df`.*\nFROM `df`\nORDER BY `x`, `y`")
+    sql("SELECT \"df\".*\nFROM \"df\"\nORDER BY \"x\", \"y\"")
   )
 
   expect_identical(
     arrange(df, pick(x), y) |> remote_query(),
-    sql("SELECT `df`.*\nFROM `df`\nORDER BY `x`, `y`")
+    sql("SELECT \"df\".*\nFROM \"df\"\nORDER BY \"x\", \"y\"")
   )
 })
 

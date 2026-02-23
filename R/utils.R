@@ -77,11 +77,11 @@ cat_line <- function(...) cat(paste0(..., "\n"), sep = "")
 
 # nocov start
 res_warn_incomplete <- function(res, hint = "n = -1") {
-  if (dbHasCompleted(res)) {
+  if (DBI::dbHasCompleted(res)) {
     return()
   }
 
-  rows <- big_mark(dbGetRowCount(res))
+  rows <- big_mark(DBI::dbGetRowCount(res))
   cli::cli_warn(
     "Only first {rows} results retrieved. Use {hint} to retrieve all."
   )
@@ -121,8 +121,9 @@ local_db_table <- function(
   con,
   value,
   name,
-  ...,
+  types = NULL,
   temporary = TRUE,
+  overwrite = FALSE,
   envir = parent.frame()
 ) {
   if (inherits(con, "Microsoft SQL Server") && temporary) {
@@ -130,8 +131,15 @@ local_db_table <- function(
   }
 
   withr::defer(DBI::dbRemoveTable(con, name), envir = envir)
-  copy_to(con, value, name, temporary = temporary, ...)
-  tbl(con, name)
+  table <- db_copy_to(
+    con,
+    name,
+    value,
+    types = types,
+    temporary = temporary,
+    overwrite = overwrite
+  )
+  new_tbl_sql(con, table, names(value))
 }
 
 local_sqlite_connection <- function(envir = parent.frame()) {
@@ -141,13 +149,12 @@ local_sqlite_connection <- function(envir = parent.frame()) {
   )
 }
 
-local_memdb_frame <- function(name, ..., frame = parent.frame()) {
-  df <- tibble::tibble(...)
-
-  withr::defer(DBI::dbRemoveTable(src_memdb()$con, name), envir = frame)
-  copy_to(src_memdb(), df, name, temporary = TRUE)
-}
-
 is_testing <- function() {
   identical(Sys.getenv("TESTTHAT"), "true")
+}
+
+# Counts the number of SELECT statements in the rendered SQL
+n_selects <- function(x) {
+  sql <- as.character(sql_render(x))
+  length(gregexpr("SELECT", sql)[[1]])
 }

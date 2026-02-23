@@ -33,54 +33,56 @@ arrange.tbl_lazy <- function(.data, ..., .by_group = FALSE) {
   dots <- partial_eval_dots(.data, ..., .named = FALSE)
   names(dots) <- NULL
 
-  .data$lazy_query <- add_arrange(.data, dots, .by_group)
+  .data$lazy_query <- add_arrange(.data$lazy_query, dots, .by_group)
   .data
 }
 
-add_arrange <- function(.data, dots, .by_group) {
-  lazy_query <- .data$lazy_query
-
-  if (.by_group) {
-    dots <- c(syms(op_grps(lazy_query)), dots)
-  }
-  if (identical(dots, lazy_query$order_vars)) {
+add_arrange <- function(lazy_query, exprs, .by_group) {
+  # Empty arrange() preserves existing ordering (like dplyr)
+  if (is_empty(exprs)) {
     return(lazy_query)
   }
 
-  # `dots` must be an empty list so that `arrange()` removes the `order_vars`
-  dots <- dots %||% list()
-
-  new_lazy_query <- lazy_select_query(
-    x = lazy_query,
-    order_by = dots,
-    order_vars = dots
-  )
-
-  if (!is_lazy_select_query(lazy_query)) {
-    return(new_lazy_query)
+  if (.by_group) {
+    exprs <- c(syms(op_grps(lazy_query)), exprs)
   }
 
-  # Needed because `ORDER BY` is evaluated before `LIMIT`
-  if (!is.null(lazy_query$limit)) {
-    return(new_lazy_query)
-  }
+  # Prepend new ordering to existing ordering (like dplyr)
+  order_vars <- c(exprs, op_sort(lazy_query))
 
-  lazy_query$order_vars <- dots
-  lazy_query$order_by <- dots
-  lazy_query
+  if (can_inline_arrange(lazy_query)) {
+    lazy_query$order_vars <- order_vars
+    lazy_query$order_by <- order_vars
+    lazy_query
+  } else {
+    lazy_select_query(
+      x = lazy_query,
+      order_by = order_vars,
+      order_vars = order_vars
+    )
+  }
 }
 
-unwrap_order_expr <- function(order_by, f, error_call = caller_env()) {
-  order_by_quo <- quo({{ order_by }})
-  order_by_env <- quo_get_env(order_by_quo)
-  order_by_expr <- quo_get_expr(order_by_quo)
-
-  if (is.null(order_by_expr)) {
-    return()
+# arrange() adds/modifies the ORDER BY clause
+# * ORDER BY is executed after LIMIT
+#   => can't inline if LIMIT is set
+can_inline_arrange <- function(lazy_query) {
+  if (!is_lazy_select_query(lazy_query)) {
+    return(FALSE)
   }
 
-  if (is_call(order_by_expr, "c")) {
-    args <- call_args(order_by_expr)
+  if (!is.null(lazy_query$limit)) {
+    return(FALSE)
+  }
+
+  TRUE
+}
+
+# Used in slice_min/slice_max and the order_by argument to window functions
+# convert a single order by expression to a list of expresions
+unwrap_order_expr <- function(order_by, f, error_call = caller_env()) {
+  if (is_call(order_by, "c")) {
+    args <- call_args(order_by)
     tibble_expr <- expr_text(expr(tibble(!!!args)))
     cli_abort(
       c(
@@ -91,32 +93,19 @@ unwrap_order_expr <- function(order_by, f, error_call = caller_env()) {
     )
   }
 
-  if (is_call(order_by_expr, c("tibble", "data.frame"))) {
-    tibble_args <- call_args(order_by_expr)
-    # browser()
-    out <- as_quosures(tibble_args, env = order_by_env)
-    return(out)
+  if (is.null(order_by)) {
+    NULL
+  } else if (is_call(order_by, c("tibble", "data.frame"))) {
+    as.list(order_by[-1])
+  } else {
+    list(order_by)
   }
-
-  list(order_by_quo)
 }
 
 swap_order_direction <- function(x) {
-  is_quo <- is_quosure(x)
-  if (is_quo) {
-    env <- quo_get_env(x)
-    x <- quo_get_expr(x)
-  }
-
   if (is_call(x, "desc", n = 1)) {
-    out <- call_args(x)[[1]]
+    x[[2]]
   } else {
-    out <- expr(desc(!!x))
+    call2("desc", x)
   }
-
-  if (is_quo) {
-    out <- as_quosure(out, env)
-  }
-
-  out
 }

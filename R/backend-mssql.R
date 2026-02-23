@@ -12,6 +12,12 @@
 #' - Custom types for `as.*` functions
 #' - Lubridate extraction functions, `year()`, `month()`, `day()` etc
 #' - Semi-automated bit <-> boolean translation (see below)
+#' - stringr functions `str_detect()`, `str_starts()`, `str_ends()` with
+#'   `fixed()` patterns work on all versions; regular expression patterns
+#'   require SQL Server 2025+ (version 17.0)
+#' - stringr functions `str_replace()`, `str_replace_all()`, `str_remove()`,
+#'   `str_remove_all()`, `str_extract()`, and `str_count()` require SQL Server
+#'   2025+ (version 17.0)
 #'
 #' Use `simulate_mssql()` with `lazy_frame()` to see simulated SQL without
 #' converting to live access database.
@@ -36,8 +42,9 @@
 #' * To convert from bit to boolean use `x == 1`
 #' * To convert from boolean to bit use `as.logical(if(x, 0, 1))`
 #'
-#' @param version Version of MS SQL to simulate. Currently only, difference is
-#'   that 15.0 and above will use `TRY_CAST()` instead of `CAST()`.
+#' @param version Version of MS SQL to simulate. Currently, 11.0 and above
+#'   will use `TRY_CAST()` instead of `CAST()`, and 17.0 and above will
+#'   support regular expression patterns in stringr functions.
 #' @name backend-mssql
 #' @aliases NULL
 #' @examples
@@ -55,9 +62,6 @@
 #' lf |> transmute(x = ifelse(c > d, "c", "d"))
 NULL
 
-#' @include verb-copy-to.R
-NULL
-
 #' @export
 #' @rdname backend-mssql
 simulate_mssql <- function(version = "15.0") {
@@ -67,6 +71,20 @@ simulate_mssql <- function(version = "15.0") {
 #' @export
 `dbplyr_edition.Microsoft SQL Server` <- function(con) {
   2L
+}
+
+#' @export
+`table_path_components.Microsoft SQL Server` <- function(x, con) {
+  # SQL Server uses asymmetric quotes [identifier], which scan() can't handle
+  # Also support standard SQL double-quote quoting "identifier"
+  lapply(x, function(path) {
+    # Split on . but not inside [] or ""
+    # Pattern: match [anything], "anything", or non-dot characters
+    matches <- gregexpr('\\[[^]]*\\]|"[^"]*"|[^.]+', path)
+    components <- regmatches(path, matches)[[1]]
+    # Remove the brackets or quotes from each component
+    gsub('^\\[|\\]$|^"|"$', "", components)
+  })
 }
 
 #' @export
@@ -86,8 +104,7 @@ simulate_mssql <- function(version = "15.0") {
   lvl = 0
 ) {
   sql_select_clauses(
-    con,
-    select = sql_clause_select(con, select, distinct, top = limit),
+    select = sql_clause_select(select, distinct, top = limit),
     from = sql_clause_from(from),
     where = sql_clause_where(where),
     group_by = sql_clause_group_by(group_by),
@@ -110,6 +127,8 @@ simulate_mssql <- function(version = "15.0") {
   returning_cols = NULL,
   method = NULL
 ) {
+  table <- as_table_path(table, con)
+
   # https://stackoverflow.com/questions/25969/insert-into-values-select-from
   conflict <- rows_check_conflict(conflict)
 
@@ -124,12 +143,12 @@ simulate_mssql <- function(version = "15.0") {
   clauses <- list2(
     parts$insert_clause,
     sql_returning_cols(con, returning_cols, "INSERTED"),
-    sql_clause_select(con, sql("*")),
+    sql_clause_select(sql("*")),
     sql_clause_from(parts$from),
     !!!parts$conflict_clauses
   )
 
-  sql_format_clauses(clauses, lvl = 0, con)
+  sql_format_clauses(clauses, lvl = 0)
 }
 
 #' @export
@@ -141,22 +160,19 @@ simulate_mssql <- function(version = "15.0") {
   ...,
   returning_cols = NULL
 ) {
+  table <- as_table_path(table, con)
   parts <- rows_prep(con, table, from, by = list(), lvl = 0)
-  insert_cols <- escape(
-    ident(insert_cols),
-    collapse = ", ",
-    parens = TRUE,
-    con = con
-  )
 
+  insert_cols_sql <- sql_escape_ident(con, insert_cols)
+  table_sql <- sql_escape_table_source(con, table)
   clauses <- list2(
-    sql_clause_insert(con, insert_cols, table),
+    sql_clause_insert(insert_cols_sql, into = table_sql),
     sql_returning_cols(con, returning_cols, "INSERTED"),
-    sql_clause_select(con, sql("*")),
+    sql_clause_select(sql("*")),
     sql_clause_from(parts$from)
   )
 
-  sql_format_clauses(clauses, lvl = 0, con)
+  sql_format_clauses(clauses, lvl = 0)
 }
 
 #' @export
@@ -169,19 +185,22 @@ simulate_mssql <- function(version = "15.0") {
   ...,
   returning_cols = NULL
 ) {
+  table <- as_table_path(table, con)
+
   # https://stackoverflow.com/a/2334741/946850
   parts <- rows_prep(con, table, from, by, lvl = 0)
   update_cols <- sql_escape_ident(con, names(update_values))
 
+  table_sql <- sql_escape_table_source(con, table)
   clauses <- list(
-    sql_clause_update(table),
+    sql_clause_update(table_sql),
     sql_clause_set(update_cols, update_values),
     sql_returning_cols(con, returning_cols, "INSERTED"),
-    sql_clause_from(table),
+    sql_clause_from(table_sql),
     sql_clause("INNER JOIN", parts$from),
     sql_clause_on(parts$where, lvl = 1)
   )
-  sql_format_clauses(clauses, lvl = 0, con)
+  sql_format_clauses(clauses, lvl = 0)
 }
 
 #' @export
@@ -195,33 +214,36 @@ simulate_mssql <- function(version = "15.0") {
   returning_cols = NULL,
   method = NULL
 ) {
+  table <- as_table_path(table, con)
+
   check_string(method, allow_null = TRUE)
   method <- method %||% "merge"
   arg_match(method, "merge", error_arg = "method")
 
   parts <- rows_prep(con, table, from, by, lvl = 0)
 
-  update_cols_esc <- sql(sql_escape_ident(con, update_cols))
-  update_values <- sql_table_prefix(con, update_cols, "...y")
+  update_cols_esc <- sql_escape_ident(con, update_cols)
+  update_values <- sql_table_prefix(con, "...y", update_cols)
   update_clause <- sql(paste0(update_cols_esc, " = ", update_values))
 
   insert_cols <- c(by, update_cols)
-  insert_cols_esc <- sql(sql_escape_ident(con, insert_cols))
-  insert_cols_qual <- sql_table_prefix(con, insert_cols, "...y")
+  insert_cols_esc <- sql_escape_ident(con, insert_cols)
+  insert_cols_qual <- sql_table_prefix(con, "...y", insert_cols)
 
+  table_sql <- sql_escape_table_source(con, table)
   clauses <- list(
-    sql_clause("MERGE INTO", table),
+    sql_clause("MERGE INTO", table_sql),
     sql_clause("USING", parts$from),
     sql_clause_on(parts$where, lvl = 1),
     sql("WHEN MATCHED THEN"),
     sql_clause("UPDATE SET", update_clause, lvl = 1),
     sql("WHEN NOT MATCHED THEN"),
-    sql_clause_insert(con, insert_cols_esc, lvl = 1),
+    sql_clause_insert(insert_cols_esc, lvl = 1),
     sql_clause("VALUES", insert_cols_qual, parens = TRUE, lvl = 1),
     sql_returning_cols(con, returning_cols, "INSERTED"),
     sql(";")
   )
-  sql_format_clauses(clauses, lvl = 0, con)
+  sql_format_clauses(clauses, lvl = 0)
 }
 
 #' @export
@@ -233,230 +255,339 @@ simulate_mssql <- function(version = "15.0") {
   ...,
   returning_cols = NULL
 ) {
+  table <- as_table_path(table, con)
   parts <- rows_prep(con, table, from, by, lvl = 0)
 
+  table_sql <- sql_escape_table_source(con, table)
   clauses <- list2(
-    sql_clause("DELETE FROM", table),
+    sql_clause("DELETE FROM", table_sql),
     sql_returning_cols(con, returning_cols, table = "DELETED"),
     !!!sql_clause_where_exists(parts$from, parts$where, not = FALSE)
   )
-  sql_format_clauses(clauses, lvl = 0, con)
+  sql_format_clauses(clauses, lvl = 0)
+}
+
+mssql_scalar_base <- function() {
+  sql_translator(
+    .parent = base_odbc_scalar,
+
+    `!` = function(x) {
+      if (mssql_needs_bit()) {
+        x <- with_mssql_bool(x)
+        sql_glue("~{mssql_as_bit(x)}")
+      } else {
+        sql_glue("NOT({x})")
+      }
+    },
+
+    `!=` = mssql_infix_comparison("!="),
+    `==` = mssql_infix_comparison("="),
+    `<` = mssql_infix_comparison("<"),
+    `<=` = mssql_infix_comparison("<="),
+    `>` = mssql_infix_comparison(">"),
+    `>=` = mssql_infix_comparison(">="),
+
+    `&` = mssql_infix_boolean("&", "AND"),
+    `&&` = mssql_infix_boolean("&", "AND"),
+    `|` = mssql_infix_boolean("|", "OR"),
+    `||` = mssql_infix_boolean("|", "OR"),
+
+    `[` = function(x, i) {
+      i <- with_mssql_bool(i)
+      sql_glue("CASE WHEN ({i}) THEN ({x}) END")
+    },
+
+    bitwShiftL = sql_not_supported("bitwShiftL"),
+    bitwShiftR = sql_not_supported("bitwShiftR"),
+
+    `if` = function(condition, true, false = NULL, missing = NULL) {
+      mssql_sql_if(
+        enquo(condition),
+        enquo(true),
+        enquo(false),
+        enquo(missing)
+      )
+    },
+    if_else = function(condition, true, false, missing = NULL) {
+      mssql_sql_if(
+        enquo(condition),
+        enquo(true),
+        enquo(false),
+        enquo(missing)
+      )
+    },
+    ifelse = function(test, yes, no) {
+      mssql_sql_if(enquo(test), enquo(yes), enquo(no))
+    },
+    case_when = mssql_case_when,
+    between = function(x, left, right) {
+      context <- sql_current_context()
+      if (context$clause == "WHERE") {
+        sql_glue("{x} BETWEEN {left} AND {right}")
+      } else {
+        sql_glue("CASE WHEN {x} BETWEEN {left} AND {right} THEN 1 ELSE 0 END")
+      }
+    },
+
+    as.logical = sql_cast("BIT"),
+
+    as.Date = sql_cast("DATE"),
+    as.numeric = sql_cast("FLOAT"),
+    as.double = sql_cast("FLOAT"),
+    as.character = sql_cast("VARCHAR(MAX)"),
+    log = sql_prefix("LOG"),
+    atan2 = sql_prefix("ATN2"),
+    ceil = sql_prefix("CEILING"),
+    ceiling = sql_prefix("CEILING"),
+
+    is.null = mssql_is_null,
+    is.na = mssql_is_null,
+
+    runif = function(n = n(), min = 0, max = 1) {
+      # https://stackoverflow.com/a/9039661
+      sql_runif("RAND(CHECKSUM(NEWID()))", n = {{ n }}, min = min, max = max)
+    },
+
+    # string functions ------------------------------------------------
+    nchar = sql_prefix("LEN"),
+    paste = sql_paste_infix(" ", "+"),
+    paste0 = sql_paste_infix("", "+"),
+    substr = sql_substr("SUBSTRING"),
+    substring = sql_substr("SUBSTRING"),
+
+    # stringr functions
+    str_length = sql_prefix("LEN"),
+    str_c = sql_paste_infix("", "+"),
+    # use COLLATE to ensure consistent behaviour https://learn.microsoft.com/en-us/sql/relational-databases/collations/set-or-change-the-column-collation?view=sql-server-ver17&source=recommendations
+    str_like = function(string, pattern, ignore_case = deprecated()) {
+      ignore_case <- deprecate_ignore_case(ignore_case)
+      if (ignore_case) {
+        sql_glue("{string} COLLATE Latin1_General_100_CI_AS LIKE {pattern}")
+      } else {
+        sql_glue("{string} COLLATE Latin1_General_100_CS_AS LIKE {pattern}")
+      }
+    },
+    str_ilike = function(string, pattern) {
+      sql_glue("{string} COLLATE Latin1_General_100_CI_AS LIKE {pattern}")
+    },
+    # Fixed pattern support for all SQL Server versions (regex requires 2025+)
+    str_detect = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("detect")
+      )
+    },
+    str_starts = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("start")
+      )
+    },
+    str_ends = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("end")
+      )
+    },
+    # no built in function: https://stackoverflow.com/questions/230138
+    str_to_title = sql_not_supported("str_to_title"),
+    # https://docs.microsoft.com/en-us/sql/t-sql/functions/substring-transact-sql?view=sql-server-ver15
+    str_sub = sql_str_sub("SUBSTRING", "LEN", optional_length = FALSE),
+
+    # lubridate ---------------------------------------------------------------
+    # https://en.wikibooks.org/wiki/SQL_Dialects_Reference/Functions_and_expressions/Date_and_time_functions
+    as_date = sql_cast("DATE"),
+
+    # Using DATETIME2 as it complies with ANSI and ISO.
+    # MS recommends DATETIME2 for new work:
+    # https://docs.microsoft.com/en-us/sql/t-sql/data-types/datetime-transact-sql?view=sql-server-2017
+    as_datetime = sql_cast("DATETIME2"),
+
+    today = \() sql_glue("CAST(SYSDATETIME() AS DATE)"),
+
+    # https://docs.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql?view=sql-server-2017
+    year = \(x) sql_glue("DATEPART(YEAR, {x})"),
+    day = \(x) sql_glue("DATEPART(DAY, {x})"),
+    mday = \(x) sql_glue("DATEPART(DAY, {x})"),
+    yday = \(x) sql_glue("DATEPART(DAYOFYEAR, {x})"),
+    hour = \(x) sql_glue("DATEPART(HOUR, {x})"),
+    minute = \(x) sql_glue("DATEPART(MINUTE, {x})"),
+    second = \(x) sql_glue("DATEPART(SECOND, {x})"),
+
+    month = function(x, label = FALSE, abbr = TRUE) {
+      check_bool(label)
+      if (!label) {
+        sql_glue("DATEPART(MONTH, {x})")
+      } else {
+        check_unsupported_arg(abbr, FALSE, backend = "SQL Server")
+        sql_glue("DATENAME(MONTH, {x})")
+      }
+    },
+
+    quarter = function(x, with_year = FALSE, fiscal_start = 1) {
+      check_bool(with_year)
+      check_unsupported_arg(fiscal_start, 1, backend = "SQL Server")
+
+      if (with_year) {
+        sql_glue("(DATENAME(YEAR, {x}) + '.' + DATENAME(QUARTER, {x}))")
+      } else {
+        sql_glue("DATEPART(QUARTER, {x})")
+      }
+    },
+
+    # clock ---------------------------------------------------------------
+    add_days = function(x, n, ...) {
+      check_dots_empty()
+      sql_glue("DATEADD(DAY, {n}, {x})")
+    },
+    add_years = function(x, n, ...) {
+      check_dots_empty()
+      sql_glue("DATEADD(YEAR, {n}, {x})")
+    },
+    date_build = function(year, month = 1L, day = 1L, ..., invalid = NULL) {
+      check_unsupported_arg(invalid, allow_null = TRUE)
+      sql_glue("DATEFROMPARTS({year}, {month}, {day})")
+    },
+    get_year = function(x) {
+      sql_glue("DATEPART(YEAR, {x})")
+    },
+    get_month = function(x) {
+      sql_glue("DATEPART(MONTH, {x})")
+    },
+    get_day = function(x) {
+      sql_glue("DATEPART(DAY, {x})")
+    },
+    date_count_between = function(start, end, precision, ..., n = 1L) {
+      check_dots_empty()
+      check_unsupported_arg(precision, allowed = "day")
+      check_unsupported_arg(n, allowed = 1L)
+      # https://learn.microsoft.com/en-us/sql/t-sql/functions/datediff-big-transact-sql?view=sql-server-ver17
+      sql_glue("DATEDIFF_BIG(DAY, {start}, {end})")
+    },
+
+    difftime = function(time1, time2, tz, units = "days") {
+      check_unsupported_arg(tz)
+      check_unsupported_arg(units, allowed = "days")
+
+      sql_glue("DATEDIFF_BIG(DAY, {time2}, {time1})")
+    }
+  )
+}
+
+# MSSQL 2012
+mssql_scalar_11 <- function() {
+  sql_translator(
+    .parent = mssql_scalar_base(),
+    as.logical = sql_try_cast("BIT"),
+    as.Date = sql_try_cast("DATE"),
+    as.POSIXct = sql_try_cast("DATETIME2"),
+    as.numeric = sql_try_cast("FLOAT"),
+    as.double = sql_try_cast("FLOAT"),
+
+    # In SQL server, CAST (even with TRY) of INTEGER and BIGINT appears
+    # fill entire columns with NULL if parsing single value fails:
+    # https://gist.github.com/DavidPatShuiFong/7b47a9804a497b605e477f1bf6c38b37
+    # So we parse to NUMERIC (which doesn't have this problem), then to the
+    # target type
+    as.integer = function(x) {
+      sql_glue("TRY_CAST(TRY_CAST({x} AS NUMERIC) AS INT)")
+    },
+    as.integer64 = function(x) {
+      sql_glue("TRY_CAST(TRY_CAST({x} AS NUMERIC(38, 0)) AS BIGINT)")
+    },
+    as.character = sql_try_cast("VARCHAR(MAX)"),
+    as_date = sql_try_cast("DATE"),
+    as_datetime = sql_try_cast("DATETIME2")
+  )
+}
+
+# MSSQL 2025 - regex functions
+# https://learn.microsoft.com/en-us/sql/t-sql/functions/regexp-like-transact-sql
+mssql_scalar_17 <- function() {
+  sql_translator(
+    .parent = mssql_scalar_11(),
+    str_detect = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("detect"),
+        f_regex = function(string, pattern, negate = FALSE) {
+          if (isTRUE(negate)) {
+            mssql_as_bit(sql_glue("NOT REGEXP_LIKE({string}, {pattern})"))
+          } else {
+            mssql_as_bit(sql_glue("REGEXP_LIKE({string}, {pattern})"))
+          }
+        }
+      )
+    },
+    str_starts = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("start"),
+        f_regex = function(string, pattern, negate = FALSE) {
+          pattern <- sql_glue("'^' + {pattern}")
+          if (isTRUE(negate)) {
+            mssql_as_bit(sql_glue("NOT REGEXP_LIKE({string}, {pattern})"))
+          } else {
+            mssql_as_bit(sql_glue("REGEXP_LIKE({string}, {pattern})"))
+          }
+        }
+      )
+    },
+    str_ends = function(string, pattern, negate = FALSE) {
+      sql_str_pattern_switch(
+        string = string,
+        pattern = {{ pattern }},
+        negate = negate,
+        f_fixed = mssql_str_detect("end"),
+        f_regex = function(string, pattern, negate = FALSE) {
+          pattern <- sql_glue("{pattern} + '$'")
+          if (isTRUE(negate)) {
+            mssql_as_bit(sql_glue("NOT REGEXP_LIKE({string}, {pattern})"))
+          } else {
+            mssql_as_bit(sql_glue("REGEXP_LIKE({string}, {pattern})"))
+          }
+        }
+      )
+    },
+    str_replace = function(string, pattern, replacement) {
+      sql_glue("REGEXP_REPLACE({string}, {pattern}, {replacement}, 1, 1)")
+    },
+    str_replace_all = function(string, pattern, replacement) {
+      sql_glue("REGEXP_REPLACE({string}, {pattern}, {replacement})")
+    },
+    str_remove = function(string, pattern) {
+      sql_glue("REGEXP_REPLACE({string}, {pattern}, '', 1, 1)")
+    },
+    str_remove_all = function(string, pattern) {
+      sql_glue("REGEXP_REPLACE({string}, {pattern}, '')")
+    },
+    str_extract = function(string, pattern) {
+      sql_glue("REGEXP_SUBSTR({string}, {pattern})")
+    },
+    str_count = function(string, pattern) {
+      sql_glue("REGEXP_COUNT({string}, {pattern})")
+    }
+  )
 }
 
 #' @export
 `sql_translation.Microsoft SQL Server` <- function(con) {
-  mssql_scalar <-
-    sql_translator(
-      .parent = base_odbc_scalar,
-
-      `!` = function(x) {
-        if (mssql_needs_bit()) {
-          x <- with_mssql_bool(x)
-          sql_glue("~{mssql_as_bit(x)}")
-        } else {
-          sql_glue("NOT({x})")
-        }
-      },
-
-      `!=` = mssql_infix_comparison("!="),
-      `==` = mssql_infix_comparison("="),
-      `<` = mssql_infix_comparison("<"),
-      `<=` = mssql_infix_comparison("<="),
-      `>` = mssql_infix_comparison(">"),
-      `>=` = mssql_infix_comparison(">="),
-
-      `&` = mssql_infix_boolean("&", "AND"),
-      `&&` = mssql_infix_boolean("&", "AND"),
-      `|` = mssql_infix_boolean("|", "OR"),
-      `||` = mssql_infix_boolean("|", "OR"),
-
-      `[` = function(x, i) {
-        i <- with_mssql_bool(i)
-        sql_glue("CASE WHEN ({i}) THEN ({x}) END")
-      },
-
-      bitwShiftL = sql_not_supported("bitwShiftL"),
-      bitwShiftR = sql_not_supported("bitwShiftR"),
-
-      `if` = function(condition, true, false = NULL, missing = NULL) {
-        mssql_sql_if(
-          enquo(condition),
-          enquo(true),
-          enquo(false),
-          enquo(missing)
-        )
-      },
-      if_else = function(condition, true, false, missing = NULL) {
-        mssql_sql_if(
-          enquo(condition),
-          enquo(true),
-          enquo(false),
-          enquo(missing)
-        )
-      },
-      ifelse = function(test, yes, no) {
-        mssql_sql_if(enquo(test), enquo(yes), enquo(no))
-      },
-      case_when = mssql_case_when,
-      between = function(x, left, right) {
-        context <- sql_current_context()
-        if (context$clause == "WHERE") {
-          sql_glue("{x} BETWEEN {left} AND {right}")
-        } else {
-          sql_glue("CASE WHEN {x} BETWEEN {left} AND {right} THEN 1 ELSE 0 END")
-        }
-      },
-
-      as.logical = sql_cast("BIT"),
-
-      as.Date = sql_cast("DATE"),
-      as.numeric = sql_cast("FLOAT"),
-      as.double = sql_cast("FLOAT"),
-      as.character = sql_cast("VARCHAR(MAX)"),
-      log = sql_prefix("LOG"),
-      atan2 = sql_prefix("ATN2"),
-      ceil = sql_prefix("CEILING"),
-      ceiling = sql_prefix("CEILING"),
-
-      is.null = mssql_is_null,
-      is.na = mssql_is_null,
-
-      runif = function(n = n(), min = 0, max = 1) {
-        # https://stackoverflow.com/a/9039661
-        sql_runif("RAND(CHECKSUM(NEWID()))", n = {{ n }}, min = min, max = max)
-      },
-
-      # string functions ------------------------------------------------
-      nchar = sql_prefix("LEN"),
-      paste = sql_paste_infix(" ", "+"),
-      paste0 = sql_paste_infix("", "+"),
-      substr = sql_substr("SUBSTRING"),
-      substring = sql_substr("SUBSTRING"),
-
-      # stringr functions
-      str_length = sql_prefix("LEN"),
-      str_c = sql_paste_infix("", "+"),
-      # use COLLATE to ensure consistent behaviour https://learn.microsoft.com/en-us/sql/relational-databases/collations/set-or-change-the-column-collation?view=sql-server-ver17&source=recommendations
-      str_like = function(string, pattern, ignore_case = deprecated()) {
-        ignore_case <- deprecate_ignore_case(ignore_case)
-        if (ignore_case) {
-          sql_glue("{string} COLLATE Latin1_General_100_CI_AS LIKE {pattern}")
-        } else {
-          sql_glue("{string} COLLATE Latin1_General_100_CS_AS LIKE {pattern}")
-        }
-      },
-      str_ilike = function(string, pattern) {
-        sql_glue("{string} COLLATE Latin1_General_100_CI_AS LIKE {pattern}")
-      },
-      # no built in function: https://stackoverflow.com/questions/230138
-      str_to_title = sql_not_supported("str_to_title"),
-      # https://docs.microsoft.com/en-us/sql/t-sql/functions/substring-transact-sql?view=sql-server-ver15
-      str_sub = sql_str_sub("SUBSTRING", "LEN", optional_length = FALSE),
-
-      # lubridate ---------------------------------------------------------------
-      # https://en.wikibooks.org/wiki/SQL_Dialects_Reference/Functions_and_expressions/Date_and_time_functions
-      as_date = sql_cast("DATE"),
-
-      # Using DATETIME2 as it complies with ANSI and ISO.
-      # MS recommends DATETIME2 for new work:
-      # https://docs.microsoft.com/en-us/sql/t-sql/data-types/datetime-transact-sql?view=sql-server-2017
-      as_datetime = sql_cast("DATETIME2"),
-
-      today = \() sql_glue("CAST(SYSDATETIME() AS DATE)"),
-
-      # https://docs.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql?view=sql-server-2017
-      year = \(x) sql_glue("DATEPART(YEAR, {x})"),
-      day = \(x) sql_glue("DATEPART(DAY, {x})"),
-      mday = \(x) sql_glue("DATEPART(DAY, {x})"),
-      yday = \(x) sql_glue("DATEPART(DAYOFYEAR, {x})"),
-      hour = \(x) sql_glue("DATEPART(HOUR, {x})"),
-      minute = \(x) sql_glue("DATEPART(MINUTE, {x})"),
-      second = \(x) sql_glue("DATEPART(SECOND, {x})"),
-
-      month = function(x, label = FALSE, abbr = TRUE) {
-        check_bool(label)
-        if (!label) {
-          sql_glue("DATEPART(MONTH, {x})")
-        } else {
-          check_unsupported_arg(abbr, FALSE, backend = "SQL Server")
-          sql_glue("DATENAME(MONTH, {x})")
-        }
-      },
-
-      quarter = function(x, with_year = FALSE, fiscal_start = 1) {
-        check_bool(with_year)
-        check_unsupported_arg(fiscal_start, 1, backend = "SQL Server")
-
-        if (with_year) {
-          sql_glue("(DATENAME(YEAR, {x}) + '.' + DATENAME(QUARTER, {x}))")
-        } else {
-          sql_glue("DATEPART(QUARTER, {x})")
-        }
-      },
-
-      # clock ---------------------------------------------------------------
-      add_days = function(x, n, ...) {
-        check_dots_empty()
-        sql_glue("DATEADD(DAY, {n}, {x})")
-      },
-      add_years = function(x, n, ...) {
-        check_dots_empty()
-        sql_glue("DATEADD(YEAR, {n}, {x})")
-      },
-      date_build = function(year, month = 1L, day = 1L, ..., invalid = NULL) {
-        check_unsupported_arg(invalid, allow_null = TRUE)
-        sql_glue("DATEFROMPARTS({year}, {month}, {day})")
-      },
-      get_year = function(x) {
-        sql_glue("DATEPART(YEAR, {x})")
-      },
-      get_month = function(x) {
-        sql_glue("DATEPART(MONTH, {x})")
-      },
-      get_day = function(x) {
-        sql_glue("DATEPART(DAY, {x})")
-      },
-      date_count_between = function(start, end, precision, ..., n = 1L) {
-        check_dots_empty()
-        check_unsupported_arg(precision, allowed = "day")
-        check_unsupported_arg(n, allowed = 1L)
-
-        sql_glue("DATEDIFF(DAY, {start}, {end})")
-      },
-
-      difftime = function(time1, time2, tz, units = "days") {
-        check_unsupported_arg(tz)
-        check_unsupported_arg(units, allowed = "days")
-
-        sql_glue("DATEDIFF(DAY, {time2}, {time1})")
-      }
-    )
-
-  if (mssql_version(con) >= "11.0") {
-    # MSSQL 2012
-    mssql_scalar <- sql_translator(
-      .parent = mssql_scalar,
-      as.logical = sql_try_cast("BIT"),
-      as.Date = sql_try_cast("DATE"),
-      as.POSIXct = sql_try_cast("DATETIME2"),
-      as.numeric = sql_try_cast("FLOAT"),
-      as.double = sql_try_cast("FLOAT"),
-
-      # In SQL server, CAST (even with TRY) of INTEGER and BIGINT appears
-      # fill entire columns with NULL if parsing single value fails:
-      # https://gist.github.com/DavidPatShuiFong/7b47a9804a497b605e477f1bf6c38b37
-      # So we parse to NUMERIC (which doesn't have this problem), then to the
-      # target type
-      as.integer = function(x) {
-        sql_glue("TRY_CAST(TRY_CAST({x} AS NUMERIC) AS INT)")
-      },
-      as.integer64 = function(x) {
-        sql_glue("TRY_CAST(TRY_CAST({x} AS NUMERIC(38, 0)) AS BIGINT)")
-      },
-      as.character = sql_try_cast("VARCHAR(MAX)"),
-      as_date = sql_try_cast("DATE"),
-      as_datetime = sql_try_cast("DATETIME2")
-    )
+  mssql_scalar <- if (mssql_version(con) >= "17.0") {
+    mssql_scalar_17()
+  } else if (mssql_version(con) >= "11.0") {
+    mssql_scalar_11()
+  } else {
+    mssql_scalar_base()
   }
 
   sql_variant(
@@ -669,6 +800,32 @@ mssql_bit_int_bit <- function(f) {
     )
 
     f_wrapped(x)
+  }
+}
+
+# SQL Server uses CHARINDEX(substring, string) instead of INSTR(string, substring)
+mssql_str_detect <- function(type = c("detect", "start", "end")) {
+  type <- arg_match(type)
+
+  function(string, pattern, negate = FALSE) {
+    index_sql <- sql_glue("CHARINDEX({pattern}, {string})")
+
+    if (negate) {
+      sql <- switch(
+        type,
+        detect = sql_glue("{index_sql} = 0"),
+        start = sql_glue("{index_sql} != 1"),
+        end = sql_glue("{index_sql} != (LEN({string}) - LEN({pattern})) + 1")
+      )
+    } else {
+      sql <- switch(
+        type,
+        detect = sql_glue("{index_sql} > 0"),
+        start = sql_glue("{index_sql} = 1"),
+        end = sql_glue("{index_sql} = (LEN({string}) - LEN({pattern})) + 1")
+      )
+    }
+    mssql_as_bit(sql)
   }
 }
 
